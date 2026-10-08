@@ -1,0 +1,30 @@
+seed: 42
+sample_rate: 16000
+
+# Where you unpacked each dataset (see README for download links)
+datasets:
+  ravdess: data/raw/ravdess
+  cremad: data/raw/crema-d
+  tess: data/raw/tess
+  savee: data/raw/savee
+
+# Dataset-specific labels -> unified labels. null drops the clip.
+label_map:
+  calm: neutral        # RAVDESS only. Use `calm: null` to drop instead.
+
+split:
+  val_frac: 0.15       # fraction of SPEAKERS (not clips) per dataset+gender group
+  test_frac: 0.15
+  # Datasets never seen in training; used only for cross-corpus evaluation.
+  cross_corpus_holdout: [savee]
+
+preprocess:
+  trim_top_db: 30      # silence threshold for trimming
+  peak_norm: 0.95      # peak-normalize to this amplitude
+  min_duration_s: 0.5  # drop clips shorter than this after trimming
+  out_dir: data/processed
+  workers: null        # null = use all cores
+
+manifest: data/manifest.csv
+manifest_processed: data/manifest_processed.csv
+report: reports/data_report.md
