@@ -1,0 +1,33 @@
+features:
+  fmax: 8000
+  fmin: 50
+  hop: 256
+  n_fft: 1024
+  n_mels: 64
+  spec_augment: true
+manifest: data/manifest_processed.csv
+model:
+  channels:
+  - 24
+  - 48
+  - 96
+  - 192
+  dropout: 0.3
+name: cnn_baseline
+out_dir: runs
+sample_rate: 16000
+seed: 42
+train:
+  batch_size: 32
+  dataset_weights: {}
+  epochs: 25
+  label_smoothing: 0.05
+  lr: 0.002
+  noise_prob: 0.5
+  num_workers: 0
+  patience: 6
+  snr_db:
+  - 15
+  - 40
+  weight_decay: 0.0001
+window_s: 3.0

@@ -1,7 +1,7 @@
 # NeuroVoice: Speech Emotion Recognition
 
 Upload audio or record from your microphone and get the predicted emotion.
-This repo is built in phases. **Phase 1 (this commit): data pipeline.**
+This repo is built in phases. **Phase 1: data pipeline. Phase 2: CNN baseline.**
 
 ## Phase 1: what it does
 1. Parses RAVDESS, CREMA-D, TESS and SAVEE into one manifest with a **shared 7-class label scheme**
@@ -56,3 +56,29 @@ neurovoice/data/build_manifest.py
 neurovoice/data/preprocess.py
 tests/                       parsers, splits, audio, and an end-to-end smoke test
 ```
+
+## Phase 2: CNN baseline
+Raw 3-second windows -> log-mel (computed inside the model) -> 4-block CNN -> 7 emotions.
+
+```bash
+# PyTorch first (CPU build is much smaller; pick the right command at pytorch.org if you have a GPU)
+pip install torch --index-url https://download.pytorch.org/whl/cpu
+pip install -r requirements.txt
+
+python -m neurovoice.train --smoke      # ~1 minute sanity check on a tiny subset
+python -m neurovoice.train              # full run (CPU: roughly 1-2 minutes per epoch)
+```
+Outputs go to `runs/cnn_baseline/`: `metrics.json`, `history.csv`, `confusion_*.png`, `best.pt`
+(the checkpoint is git-ignored).
+
+**Training details**
+- Class-weighted loss (inverse frequency) so small classes like "surprised" are not ignored.
+- Augmentation: random crop, Gaussian noise at random SNR, SpecAugment masks.
+- Model selection by **validation UAR** only. Test and cross-corpus (SAVEE) sets are evaluated once at the end.
+- Reported: accuracy, UAR, macro-F1, per-class recall, confusion matrices, and breakdowns by dataset and gender.
+- Optional `train.dataset_weights` (e.g. `{tess: 0.5}`) down-weights the very clean TESS corpus. Good for an ablation.
+
+**Known limitations**
+- In-corpus val/test have only ~32 "surprised" clips (CREMA-D has none), so that class's score is noisy.
+  Use the SAVEE cross-corpus result as the stronger signal.
+- Clips are center-cropped/padded to 3 s at evaluation; sliding-window inference comes with the demo app.
