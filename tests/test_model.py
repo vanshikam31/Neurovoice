@@ -32,3 +32,11 @@ def test_dataset_crops_and_pads(tmp_path):
     assert short.shape == long.shape == (48000,)
     assert short[16000:].abs().sum() == 0          # zero-padded tail
     assert (w_short, w_long) == (0.5, 1.0)
+
+
+def test_windows_style_paths_are_accepted(tmp_path):
+    wav = tmp_path / "a.wav"
+    sf.write(wav, torch.randn(16000).numpy() * 0.1, 16000)
+    df = pd.DataFrame({"proc_path": [str(wav).replace("/", "\\")], "label": [0], "dataset": ["tess"]})
+    y, label, _ = EmotionDataset(df, window_s=1.0)[0]
+    assert y.shape == (16000,) and label == 0
