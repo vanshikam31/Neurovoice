@@ -14,7 +14,7 @@ features:                  # log-mel computed on the fly inside the model
   norm: instance           # instance = one mean/std per clip | band = per mel band over time
 
 data:
-  pad_mode: zeros          # zeros | repeat  (how clips shorter than window_s are filled)
+  pad_mode: repeat         # zeros | repeat (fill for clips shorter than window_s). repeat: see README results
 
 model:
   channels: [24, 48, 96, 192]   # small on purpose: trains on CPU
@@ -26,7 +26,7 @@ train:
   lr: 0.002
   weight_decay: 0.0001
   label_smoothing: 0.05
-  patience: 6              # early stopping on validation UAR
+  patience: 100            # 100 = early stopping effectively off (val UAR is noisy while the LR is high)
   num_workers: 0           # keep 0 on Windows
   noise_prob: 0.5          # chance of adding Gaussian noise
   snr_db: [15, 40]

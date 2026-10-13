@@ -82,3 +82,31 @@ Outputs go to `runs/cnn_baseline/`: `metrics.json`, `history.csv`, `confusion_*.
 - In-corpus val/test have only ~32 "surprised" clips (CREMA-D has none), so that class's score is noisy.
   Use the SAVEE cross-corpus result as the stronger signal.
 - Clips are center-cropped/padded to 3 s at evaluation; sliding-window inference comes with the demo app.
+
+## Results: CNN baseline and padding/normalization ablation
+3 seeds per variant, mean ± std. UAR = unweighted average recall (chance = 0.143).
+In-corpus = unseen speakers from RAVDESS/CREMA-D. Cross-corpus = SAVEE, never used in training.
+
+| Variant | val UAR | test UAR | SAVEE UAR | SAVEE clips predicted "disgust" |
+|---|---|---|---|---|
+| baseline (zero-pad, instance norm) | 0.627 ± 0.007 | 0.685 ± 0.010 | 0.266 ± 0.016 | 0.483 ± 0.052 |
+| **repeat-pad** | **0.645 ± 0.010** | **0.690 ± 0.001** | **0.313 ± 0.005** | **0.103 ± 0.011** |
+| per-band norm | 0.613 ± 0.011 | 0.665 ± 0.002 | 0.205 ± 0.022 | 0.473 ± 0.078 |
+| repeat-pad + per-band norm | 0.624 ± 0.001 | 0.661 ± 0.009 | 0.276 ± 0.023 | 0.115 ± 0.059 |
+
+The true share of "disgust" clips in SAVEE is 60/480 = 0.125.
+
+**Finding 1: zero-padding made the model call unfamiliar audio "disgust".** The first baseline model labelled
+about half of all SAVEE clips as disgust. Looping short clips instead of padding them with silence cut that to
+about 10%, raised SAVEE UAR from 0.266 to 0.313 (all three repeat-pad seeds beat all three baseline seeds), and left
+in-corpus test UAR unchanged (0.685 vs 0.690). The mechanism is not isolated: zero-padding changes both the
+amount of silence (which reveals clip length) and the statistics used for per-clip normalization.
+
+**Finding 2: per-band normalization did not help.** It lowered both test and SAVEE UAR, with and without repeat-padding.
+
+**Limits of these results**
+- The cross-corpus gap is still large (0.69 in-corpus vs 0.31 on SAVEE), so padding explains only part of it.
+- SAVEE is 480 clips from 4 male speakers; 3 seeds give only a rough idea of run-to-run variation.
+- Early stopping is off (`patience: 100`): validation UAR is noisy while the learning rate is high, and one
+  early-stopped run (best epoch 5) scored far lower than the same configuration trained to the end.
+- Models were trained for the full 25-epoch schedule on a Colab T4 GPU; per-seed numbers are in `reports/`.
