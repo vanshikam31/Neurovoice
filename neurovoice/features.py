@@ -10,8 +10,12 @@ import torch.nn as nn
 class LogMel(nn.Module):
     def __init__(self, sr: int = 16000, n_fft: int = 1024, hop: int = 256, n_mels: int = 64,
                  fmin: float = 50, fmax: float = 8000, spec_augment: bool = True,
-                 freq_mask: int = 8, time_mask: int = 24, n_masks: int = 2):
+                 freq_mask: int = 8, time_mask: int = 24, n_masks: int = 2,
+                 norm: str = "instance"):
         super().__init__()
+        if norm not in ("instance", "band"):
+            raise ValueError(f"norm must be 'instance' or 'band', got {norm!r}")
+        self.norm = norm
         self.n_fft, self.hop = n_fft, hop
         self.spec_augment, self.freq_mask, self.time_mask, self.n_masks = spec_augment, freq_mask, time_mask, n_masks
         fb = librosa.filters.mel(sr=sr, n_fft=n_fft, n_mels=n_mels, fmin=fmin, fmax=fmax)
@@ -24,7 +28,10 @@ class LogMel(nn.Module):
                           return_complex=True, center=True)
         mel = torch.matmul(self.fb, spec.abs().pow(2))                    # (B, n_mels, T)
         x = torch.log(mel + 1e-6)
-        x = (x - x.mean(dim=(1, 2), keepdim=True)) / (x.std(dim=(1, 2), keepdim=True) + 1e-5)
+        if self.norm == "instance":      # one mean/std per utterance
+            x = (x - x.mean(dim=(1, 2), keepdim=True)) / (x.std(dim=(1, 2), keepdim=True) + 1e-5)
+        else:                            # per mel band, over time (removes fixed channel/mic coloring)
+            x = (x - x.mean(dim=2, keepdim=True)) / (x.std(dim=2, keepdim=True) + 1e-5)
         if self.training and self.spec_augment:
             x = self._mask(x)
         return x.unsqueeze(1)

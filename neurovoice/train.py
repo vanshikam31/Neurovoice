@@ -2,6 +2,8 @@
 
     python -m neurovoice.train --config configs/train_cnn.yaml
     python -m neurovoice.train --config configs/train_cnn.yaml --smoke   # 1-minute sanity check
+    python -m neurovoice.train --resume       # continue after Ctrl+C
+    python -m neurovoice.train --eval-only    # evaluate best checkpoint without training
 
 Model selection uses validation UAR only. Test and cross-corpus sets are touched once, at the end.
 """
@@ -50,7 +52,8 @@ def make_loader(df: pd.DataFrame, cfg: dict, train: bool) -> DataLoader:
     t = cfg["train"]
     ds = EmotionDataset(df, cfg["sample_rate"], cfg["window_s"], train=train,
                         noise_prob=t.get("noise_prob", 0.5), snr_db=tuple(t.get("snr_db", (15, 40))),
-                        dataset_weights=t.get("dataset_weights") or {})
+                        dataset_weights=t.get("dataset_weights") or {},
+                        pad_mode=(cfg.get("data") or {}).get("pad_mode", "zeros"))
     return DataLoader(ds, batch_size=t["batch_size"], shuffle=train, num_workers=t.get("num_workers", 0))
 
 
@@ -79,7 +82,30 @@ def evaluate_split(model, df: pd.DataFrame, cfg: dict, device, out_dir: Path, na
     return s
 
 
-def run(cfg: dict, epochs: int | None = None, smoke: bool = False) -> dict:
+def build_model(cfg: dict, device) -> EmotionCNN:
+    return EmotionCNN(n_classes=len(EMOTIONS), channels=tuple(cfg["model"]["channels"]),
+                      dropout=cfg["model"]["dropout"], sample_rate=cfg["sample_rate"],
+                      **cfg["features"]).to(device)
+
+
+def final_eval(model, splits: dict, cfg: dict, device, out_dir: Path, best_epoch: int, n_params: int) -> dict:
+    results = {"best_epoch": best_epoch, "params": n_params}
+    for name in ("val", "test", "xcorpus_test"):
+        if name in splits and len(splits[name]):
+            results[name] = evaluate_split(model, splits[name], cfg, device, out_dir, name)
+    (out_dir / "metrics.json").write_text(json.dumps(results, indent=2))
+    lines = [f"\nBest epoch: {best_epoch}", f"{'split':<14}{'n':>6}{'acc':>8}{'UAR':>8}{'macroF1':>9}"]
+    for name in ("val", "test", "xcorpus_test"):
+        if name in results:
+            r = results[name]
+            lines.append(f"{name:<14}{r['n']:>6}{r['accuracy']:>8.3f}{r['uar']:>8.3f}{r['macro_f1']:>9.3f}")
+    log.info("\n".join(lines))
+    log.info("Saved results to %s", out_dir)
+    return results
+
+
+def run(cfg: dict, epochs: int | None = None, smoke: bool = False,
+        resume: bool = False, eval_only: bool = False) -> dict:
     set_seed(cfg["seed"])
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     t = cfg["train"]
@@ -94,12 +120,23 @@ def run(cfg: dict, epochs: int | None = None, smoke: bool = False) -> dict:
 
     out_dir = Path(cfg["out_dir"]) / cfg["name"]
     out_dir.mkdir(parents=True, exist_ok=True)
+
+    # Evaluate a saved checkpoint without training (e.g. after stopping a run early).
+    if eval_only:
+        if not (out_dir / "best.pt").exists():
+            raise FileNotFoundError(f"{out_dir / 'best.pt'} not found. Train first.")
+        ck = torch.load(out_dir / "best.pt", map_location=device, weights_only=False)
+        cfg = {**cfg, **{k: ck["config"][k] for k in ("sample_rate", "window_s", "features", "model")},
+               "data": ck["config"].get("data", {})}      # old checkpoints: zero padding
+        model = build_model(cfg, device)
+        model.load_state_dict(ck["model"])
+        log.info("Evaluating best checkpoint (epoch %d)", ck["epoch"])
+        return final_eval(model, splits, cfg, device, out_dir, ck["epoch"], sum(p.numel() for p in model.parameters()))
+
     with open(out_dir / "config.yaml", "w") as f:
         yaml.safe_dump(cfg, f)
 
-    model = EmotionCNN(n_classes=len(EMOTIONS), channels=tuple(cfg["model"]["channels"]),
-                       dropout=cfg["model"]["dropout"], sample_rate=cfg["sample_rate"],
-                       **cfg["features"]).to(device)
+    model = build_model(cfg, device)
     n_params = sum(p.numel() for p in model.parameters())
     log.info("device=%s | params=%.2fM | train=%d val=%d", device, n_params / 1e6, len(train_df), len(val_df))
 
@@ -111,54 +148,61 @@ def run(cfg: dict, epochs: int | None = None, smoke: bool = False) -> dict:
     opt = torch.optim.AdamW(model.parameters(), lr=t["lr"], weight_decay=t["weight_decay"])
     sched = torch.optim.lr_scheduler.OneCycleLR(opt, max_lr=t["lr"], epochs=epochs, steps_per_epoch=len(train_loader))
 
-    best_uar, best_epoch, history = -1.0, 0, []
-    for epoch in range(1, epochs + 1):
-        t0 = time.time()
-        model.train()
-        losses = []
-        for x, y, sw in tqdm(train_loader, desc=f"epoch {epoch}", leave=False):
-            x, y, sw = x.to(device), y.to(device), sw.to(device)
-            loss = weighted_ce(model(x), y, sw, cw, t.get("label_smoothing", 0.0))
-            opt.zero_grad()
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)
-            opt.step()
-            sched.step()
-            losses.append(loss.item())
+    best_uar, best_epoch, history, start_epoch = -1.0, 0, [], 1
+    last_path = out_dir / "last.pt"
+    if resume:
+        if last_path.exists():
+            ck = torch.load(last_path, map_location=device, weights_only=False)
+            model.load_state_dict(ck["model"])
+            opt.load_state_dict(ck["opt"])
+            sched.load_state_dict(ck["sched"])
+            start_epoch, best_uar, best_epoch, history = ck["epoch"] + 1, ck["best_uar"], ck["best_epoch"], ck["history"]
+            log.info("Resumed after epoch %d (best val UAR %.3f at epoch %d)", ck["epoch"], best_uar, best_epoch)
+        else:
+            log.warning("--resume given but %s not found; starting from scratch", last_path)
 
-        val_pred = predict(model, make_loader(val_df, cfg, train=False), device).argmax(axis=1)
-        vs = summarize(val_df["label"].to_numpy(), val_pred, EMOTIONS)
-        history.append({"epoch": epoch, "train_loss": float(np.mean(losses)),
-                        "val_acc": vs["accuracy"], "val_uar": vs["uar"], "val_macro_f1": vs["macro_f1"]})
-        improved = vs["uar"] > best_uar
-        if improved:
-            best_uar, best_epoch = vs["uar"], epoch
-            torch.save({"model": model.state_dict(), "config": cfg, "epoch": epoch}, out_dir / "best.pt")
-        log.info("epoch %02d | loss %.3f | val acc %.3f UAR %.3f F1 %.3f | %.0fs%s", epoch,
-                 history[-1]["train_loss"], vs["accuracy"], vs["uar"], vs["macro_f1"],
-                 time.time() - t0, "  *best*" if improved else "")
-        if epoch - best_epoch >= t.get("patience", 6):
-            log.info("Early stopping (no val UAR gain for %d epochs)", t.get("patience", 6))
-            break
+    done = start_epoch - 1
+    try:
+        for epoch in range(start_epoch, epochs + 1):
+            t0 = time.time()
+            model.train()
+            losses = []
+            for x, y, sw in tqdm(train_loader, desc=f"epoch {epoch}", leave=False):
+                x, y, sw = x.to(device), y.to(device), sw.to(device)
+                loss = weighted_ce(model(x), y, sw, cw, t.get("label_smoothing", 0.0))
+                opt.zero_grad()
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)
+                opt.step()
+                sched.step()
+                losses.append(loss.item())
 
-    pd.DataFrame(history).to_csv(out_dir / "history.csv", index=False)
+            val_pred = predict(model, make_loader(val_df, cfg, train=False), device).argmax(axis=1)
+            vs = summarize(val_df["label"].to_numpy(), val_pred, EMOTIONS)
+            history.append({"epoch": epoch, "train_loss": float(np.mean(losses)),
+                            "val_acc": vs["accuracy"], "val_uar": vs["uar"], "val_macro_f1": vs["macro_f1"]})
+            improved = vs["uar"] > best_uar
+            if improved:
+                best_uar, best_epoch = vs["uar"], epoch
+                torch.save({"model": model.state_dict(), "config": cfg, "epoch": epoch}, out_dir / "best.pt")
+            torch.save({"model": model.state_dict(), "opt": opt.state_dict(), "sched": sched.state_dict(),
+                        "epoch": epoch, "best_uar": best_uar, "best_epoch": best_epoch, "history": history}, last_path)
+            pd.DataFrame(history).to_csv(out_dir / "history.csv", index=False)
+            done = epoch
+            log.info("epoch %02d | loss %.3f | val acc %.3f UAR %.3f F1 %.3f | %.0fs%s", epoch,
+                     history[-1]["train_loss"], vs["accuracy"], vs["uar"], vs["macro_f1"],
+                     time.time() - t0, "  *best*" if improved else "")
+            if epoch - best_epoch >= t.get("patience", 6):
+                log.info("Early stopping (no val UAR gain for %d epochs)", t.get("patience", 6))
+                break
+    except KeyboardInterrupt:
+        log.info("\nStopped. Finished epochs are saved (last: %d, best: %d).", done, best_epoch)
+        log.info("Continue training:      python -m neurovoice.train --resume")
+        log.info("Evaluate best so far:   python -m neurovoice.train --eval-only")
+        return {}
 
-    # Final evaluation with the best checkpoint
-    model.load_state_dict(torch.load(out_dir / "best.pt", map_location=device)["model"])
-    results = {"best_epoch": best_epoch, "params": n_params}
-    for name in ("val", "test", "xcorpus_test"):
-        if name in splits and len(splits[name]):
-            results[name] = evaluate_split(model, splits[name], cfg, device, out_dir, name)
-    (out_dir / "metrics.json").write_text(json.dumps(results, indent=2))
-
-    lines = [f"\nBest epoch: {best_epoch}", f"{'split':<14}{'n':>6}{'acc':>8}{'UAR':>8}{'macroF1':>9}"]
-    for name in ("val", "test", "xcorpus_test"):
-        if name in results:
-            r = results[name]
-            lines.append(f"{name:<14}{r['n']:>6}{r['accuracy']:>8.3f}{r['uar']:>8.3f}{r['macro_f1']:>9.3f}")
-    log.info("\n".join(lines))
-    log.info("Saved results to %s", out_dir)
-    return results
+    model.load_state_dict(torch.load(out_dir / "best.pt", map_location=device, weights_only=False)["model"])
+    return final_eval(model, splits, cfg, device, out_dir, best_epoch, n_params)
 
 
 def main() -> None:
@@ -167,8 +211,10 @@ def main() -> None:
     ap.add_argument("--config", default="configs/train_cnn.yaml")
     ap.add_argument("--epochs", type=int, default=None)
     ap.add_argument("--smoke", action="store_true", help="tiny subset, 1 epoch: checks the pipeline runs")
+    ap.add_argument("--resume", action="store_true", help="continue from runs/<name>/last.pt")
+    ap.add_argument("--eval-only", action="store_true", help="evaluate runs/<name>/best.pt, no training")
     a = ap.parse_args()
-    run(load_config(a.config), epochs=a.epochs, smoke=a.smoke)
+    run(load_config(a.config), epochs=a.epochs, smoke=a.smoke, resume=a.resume, eval_only=a.eval_only)
 
 
 if __name__ == "__main__":

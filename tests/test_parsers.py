@@ -59,3 +59,13 @@ def test_savee_both_layouts(tmp_path):
     assert recs["su05"]["emotion_raw"] == "surprised"
     assert recs["su05"]["speaker_id"] == "savee_JE"
     assert len(recs) == 2
+
+
+def test_tess_typo_prefix_is_not_a_new_speaker(tmp_path):
+    touch(tmp_path / "OAF_Fear" / "OAF_bar_fear.wav")
+    touch(tmp_path / "OAF_Fear" / "OA_bite_fear.wav")      # typo'd prefix
+    touch(tmp_path / "YAF_fear" / "YAF_bar_fear.wav")
+    touch(tmp_path / "YAF_fear" / "XYZ_bar_fear.wav")      # unknown -> skipped
+    recs = parse_tess(tmp_path)
+    assert {r["speaker_id"] for r in recs} == {"tess_OAF", "tess_YAF"}
+    assert len(recs) == 3

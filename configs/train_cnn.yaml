@@ -11,6 +11,10 @@ features:                  # log-mel computed on the fly inside the model
   fmin: 50
   fmax: 8000
   spec_augment: true       # train-time frequency/time masking
+  norm: instance           # instance = one mean/std per clip | band = per mel band over time
+
+data:
+  pad_mode: zeros          # zeros | repeat  (how clips shorter than window_s are filled)
 
 model:
   channels: [24, 48, 96, 192]   # small on purpose: trains on CPU
