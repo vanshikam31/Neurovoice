@@ -1,0 +1,35 @@
+name: wavlm_base_plus
+seed: 42
+manifest: data/manifest_processed.csv
+sample_rate: 16000
+window_s: 3.0
+
+data:
+  pad_mode: repeat           # same as the best CNN setting, so the comparison is fair
+
+model:
+  type: wavlm
+  pretrained: microsoft/wavlm-base-plus   # set to null for a random-init control (needs backbone_config)
+  dropout: 0.1
+  layer_weighting: true      # learn a weighted sum over all transformer layers
+  freeze_feature_encoder: true
+  layerdrop: 0.0
+
+train:
+  epochs: 10
+  batch_size: 16
+  lr: 0.00005                # pretrained backbone
+  head_lr: 0.001             # new classification head + layer weights
+  pct_start: 0.1             # short warm-up, then decay
+  weight_decay: 0.01
+  grad_clip: 1.0
+  label_smoothing: 0.05
+  patience: 100              # early stopping off (see README)
+  num_workers: 2
+  noise_prob: 0.5
+  snr_db: [15, 40]
+  amp: true                  # mixed precision on GPU (CPU runs ignore this)
+  dataset_weights: {}
+  delete_last_when_done: true   # last.pt (optimizer state) is ~1 GB; best.pt is kept
+
+out_dir: runs

@@ -7,3 +7,4 @@ tqdm>=4.65
 pytest>=7.4
 matplotlib>=3.7
 # torch: install separately, see README (Phase 2)
+transformers>=4.40   # only needed for the WavLM model (Phase 3)

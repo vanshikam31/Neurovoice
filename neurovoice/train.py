@@ -29,6 +29,7 @@ from .data.dataset import EmotionDataset
 from .data.labels import EMOTIONS
 from .metrics import breakdown, plot_confusion, summarize
 from .models.cnn import EmotionCNN
+from .models.wavlm import EmotionWavLM
 
 log = logging.getLogger(__name__)
 
@@ -63,16 +64,24 @@ def weighted_ce(logits, y, sample_w, class_w, smoothing: float):
     return (ce * w).sum() / w.sum().clamp_min(1e-8)
 
 
+def use_amp(cfg: dict, device) -> bool:
+    return bool(cfg["train"].get("amp", False)) and device.type == "cuda"
+
+
 @torch.no_grad()
-def predict(model, loader, device) -> np.ndarray:
+def predict(model, loader, device, amp: bool = False) -> np.ndarray:
     model.eval()
-    out = [F.softmax(model(x.to(device)), dim=1).cpu().numpy() for x, _, _ in loader]
+    out = []
+    for x, _, _ in loader:
+        with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=amp):
+            logits = model(x.to(device))
+        out.append(F.softmax(logits.float(), dim=1).cpu().numpy())
     return np.concatenate(out) if out else np.zeros((0, len(EMOTIONS)))
 
 
 def evaluate_split(model, df: pd.DataFrame, cfg: dict, device, out_dir: Path, name: str) -> dict:
     df = df.reset_index(drop=True)
-    pred = predict(model, make_loader(df, cfg, train=False), device).argmax(axis=1)
+    pred = predict(model, make_loader(df, cfg, train=False), device, use_amp(cfg, device)).argmax(axis=1)
     y = df["label"].to_numpy()
     s = summarize(y, pred, EMOTIONS)
     s["by_dataset"] = breakdown(df, y, pred, "dataset", EMOTIONS)
@@ -82,10 +91,29 @@ def evaluate_split(model, df: pd.DataFrame, cfg: dict, device, out_dir: Path, na
     return s
 
 
-def build_model(cfg: dict, device) -> EmotionCNN:
+def build_model(cfg: dict, device) -> torch.nn.Module:
+    m = cfg["model"]
+    if m.get("type", "cnn") == "wavlm":
+        return EmotionWavLM(n_classes=len(EMOTIONS), pretrained=m.get("pretrained"), dropout=m.get("dropout", 0.1),
+                            layer_weighting=m.get("layer_weighting", True),
+                            freeze_feature_encoder=m.get("freeze_feature_encoder", True),
+                            layerdrop=m.get("layerdrop", 0.0), backbone_config=m.get("backbone_config")).to(device)
     return EmotionCNN(n_classes=len(EMOTIONS), channels=tuple(cfg["model"]["channels"]),
                       dropout=cfg["model"]["dropout"], sample_rate=cfg["sample_rate"],
                       **cfg["features"]).to(device)
+
+
+def make_optimizer(model, cfg: dict):
+    """AdamW. Pretrained backbones get a small lr and the new head a larger one (`head_lr`)."""
+    t = cfg["train"]
+    if hasattr(model, "backbone"):
+        head_lr = t.get("head_lr", t["lr"])
+        bb = [p for p in model.backbone.parameters() if p.requires_grad]
+        rest = [p for n, p in model.named_parameters() if not n.startswith("backbone.") and p.requires_grad]
+        groups, max_lr = [{"params": bb, "lr": t["lr"]}, {"params": rest, "lr": head_lr}], [t["lr"], head_lr]
+    else:
+        groups, max_lr = [{"params": [p for p in model.parameters() if p.requires_grad]}], t["lr"]
+    return torch.optim.AdamW(groups, lr=t["lr"], weight_decay=t["weight_decay"]), max_lr
 
 
 def final_eval(model, splits: dict, cfg: dict, device, out_dir: Path, best_epoch: int, n_params: int) -> dict:
@@ -118,7 +146,7 @@ def run(cfg: dict, epochs: int | None = None, smoke: bool = False,
         epochs = 1
     train_df, val_df = splits["train"], splits["val"]
 
-    out_dir = Path(cfg["out_dir"]) / cfg["name"]
+    out_dir = Path(cfg["out_dir"]) / (cfg["name"] + ("_smoke" if smoke else ""))
     out_dir.mkdir(parents=True, exist_ok=True)
 
     # Evaluate a saved checkpoint without training (e.g. after stopping a run early).
@@ -126,7 +154,8 @@ def run(cfg: dict, epochs: int | None = None, smoke: bool = False,
         if not (out_dir / "best.pt").exists():
             raise FileNotFoundError(f"{out_dir / 'best.pt'} not found. Train first.")
         ck = torch.load(out_dir / "best.pt", map_location=device, weights_only=False)
-        cfg = {**cfg, **{k: ck["config"][k] for k in ("sample_rate", "window_s", "features", "model")},
+        cfg = {**cfg, **{k: ck["config"][k] for k in ("sample_rate", "window_s", "features", "model")
+                                 if k in ck["config"]},
                "data": ck["config"].get("data", {})}      # old checkpoints: zero padding
         model = build_model(cfg, device)
         model.load_state_dict(ck["model"])
@@ -138,15 +167,20 @@ def run(cfg: dict, epochs: int | None = None, smoke: bool = False,
 
     model = build_model(cfg, device)
     n_params = sum(p.numel() for p in model.parameters())
-    log.info("device=%s | params=%.2fM | train=%d val=%d", device, n_params / 1e6, len(train_df), len(val_df))
+    n_train = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    log.info("device=%s | params=%.2fM (trainable %.2fM) | train=%d val=%d | amp=%s", device, n_params / 1e6,
+             n_train / 1e6, len(train_df), len(val_df), use_amp(cfg, device))
 
     cw = class_weights(train_df["label"].to_numpy(), len(EMOTIONS))
     log.info("class weights: %s", {e: round(float(w), 2) for e, w in zip(EMOTIONS, cw)})
     cw = cw.to(device)
 
     train_loader = make_loader(train_df, cfg, train=True)
-    opt = torch.optim.AdamW(model.parameters(), lr=t["lr"], weight_decay=t["weight_decay"])
-    sched = torch.optim.lr_scheduler.OneCycleLR(opt, max_lr=t["lr"], epochs=epochs, steps_per_epoch=len(train_loader))
+    opt, max_lr = make_optimizer(model, cfg)
+    sched = torch.optim.lr_scheduler.OneCycleLR(opt, max_lr=max_lr, epochs=epochs, steps_per_epoch=len(train_loader),
+                                                pct_start=t.get("pct_start", 0.3))
+    amp = use_amp(cfg, device)
+    scaler = torch.amp.GradScaler(device.type, enabled=amp)
 
     best_uar, best_epoch, history, start_epoch = -1.0, 0, [], 1
     last_path = out_dir / "last.pt"
@@ -156,6 +190,8 @@ def run(cfg: dict, epochs: int | None = None, smoke: bool = False,
             model.load_state_dict(ck["model"])
             opt.load_state_dict(ck["opt"])
             sched.load_state_dict(ck["sched"])
+            if amp and ck.get("scaler"):
+                scaler.load_state_dict(ck["scaler"])
             start_epoch, best_uar, best_epoch, history = ck["epoch"] + 1, ck["best_uar"], ck["best_epoch"], ck["history"]
             log.info("Resumed after epoch %d (best val UAR %.3f at epoch %d)", ck["epoch"], best_uar, best_epoch)
         else:
@@ -169,15 +205,19 @@ def run(cfg: dict, epochs: int | None = None, smoke: bool = False,
             losses = []
             for x, y, sw in tqdm(train_loader, desc=f"epoch {epoch}", leave=False):
                 x, y, sw = x.to(device), y.to(device), sw.to(device)
-                loss = weighted_ce(model(x), y, sw, cw, t.get("label_smoothing", 0.0))
+                with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=amp):
+                    logits = model(x)
+                loss = weighted_ce(logits.float(), y, sw, cw, t.get("label_smoothing", 0.0))
                 opt.zero_grad()
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)
-                opt.step()
+                scaler.scale(loss).backward()
+                scaler.unscale_(opt)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), t.get("grad_clip", 5.0))
+                scaler.step(opt)
+                scaler.update()
                 sched.step()
                 losses.append(loss.item())
 
-            val_pred = predict(model, make_loader(val_df, cfg, train=False), device).argmax(axis=1)
+            val_pred = predict(model, make_loader(val_df, cfg, train=False), device, amp).argmax(axis=1)
             vs = summarize(val_df["label"].to_numpy(), val_pred, EMOTIONS)
             history.append({"epoch": epoch, "train_loss": float(np.mean(losses)),
                             "val_acc": vs["accuracy"], "val_uar": vs["uar"], "val_macro_f1": vs["macro_f1"]})
@@ -186,12 +226,13 @@ def run(cfg: dict, epochs: int | None = None, smoke: bool = False,
                 best_uar, best_epoch = vs["uar"], epoch
                 torch.save({"model": model.state_dict(), "config": cfg, "epoch": epoch}, out_dir / "best.pt")
             torch.save({"model": model.state_dict(), "opt": opt.state_dict(), "sched": sched.state_dict(),
-                        "epoch": epoch, "best_uar": best_uar, "best_epoch": best_epoch, "history": history}, last_path)
+                        "scaler": scaler.state_dict() if amp else None, "epoch": epoch, "best_uar": best_uar, "best_epoch": best_epoch, "history": history}, last_path)
             pd.DataFrame(history).to_csv(out_dir / "history.csv", index=False)
             done = epoch
-            log.info("epoch %02d | loss %.3f | val acc %.3f UAR %.3f F1 %.3f | %.0fs%s", epoch,
+            mem = f" | peak GPU {torch.cuda.max_memory_allocated() / 1e9:.1f}GB" if device.type == "cuda" else ""
+            log.info("epoch %02d | loss %.3f | val acc %.3f UAR %.3f F1 %.3f | %.0fs%s%s", epoch,
                      history[-1]["train_loss"], vs["accuracy"], vs["uar"], vs["macro_f1"],
-                     time.time() - t0, "  *best*" if improved else "")
+                     time.time() - t0, mem, "  *best*" if improved else "")
             if epoch - best_epoch >= t.get("patience", 6):
                 log.info("Early stopping (no val UAR gain for %d epochs)", t.get("patience", 6))
                 break
@@ -202,7 +243,10 @@ def run(cfg: dict, epochs: int | None = None, smoke: bool = False,
         return {}
 
     model.load_state_dict(torch.load(out_dir / "best.pt", map_location=device, weights_only=False)["model"])
-    return final_eval(model, splits, cfg, device, out_dir, best_epoch, n_params)
+    results = final_eval(model, splits, cfg, device, out_dir, best_epoch, n_params)
+    if t.get("delete_last_when_done", False):
+        last_path.unlink(missing_ok=True)      # resume state is large for WavLM; not needed once finished
+    return results
 
 
 def main() -> None:
